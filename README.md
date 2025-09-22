@@ -9,6 +9,7 @@ teams can keep up with high-volume events.
 ### Authentication & Devices
 - `POST /api/mobile/login` — username/password login that returns a bearer token and staff profile
 - `POST /api/mobile/devices/register` — register APNs tokens for the signed-in staff member
+- `POST /api/mobile/devices/heartbeat` — capture liveness pings to record `last_seen` timestamps for devices
 
 ### Shift Operations
 - `GET /api/mobile/trucks` — list active trucks the staff member can operate
@@ -17,6 +18,9 @@ teams can keep up with high-volume events.
 - `POST /api/mobile/shift/checkin` — begin a shift at a location
 - `POST /api/mobile/shift/{id}/checkout` — close out a shift and notify connected devices
 - `POST /api/mobile/shift/{id}/pause` / `POST /api/mobile/shift/{id}/resume` — manage temporary pauses
+- `GET /api/mobile/shift/{id}/config` — view throttle and slot capacity configuration for the shift
+- `PATCH /api/mobile/shift/{id}/config` — adjust throttle/slot capacity values in real time
+- `GET /api/mobile/shift/{id}/summary` — aggregate order counts, revenue, and average prep time metrics
 
 ### Menu & Inventory
 - `GET /api/mobile/shift/{id}/menu` — fetch base menu items with per-shift overrides

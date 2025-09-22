@@ -1,6 +1,6 @@
 # FusionX Backend Roadmap
 
-_Last updated: 2024-02-16_
+_Last updated: 2024-03-01_
 
 ## Legend
 - [x] Completed
@@ -20,9 +20,9 @@ _Last updated: 2024-02-16_
 ## Phase 1 – Operational MVP (In progress)
 - [x] Provide mobile endpoint to list active trucks a staff member can act on (Iteration 1)
 - [x] Provide mobile endpoint to list active service locations for shift check-in (Iteration 1)
-- [ ] Add per-shift summary endpoint (order counts, revenue, average prep time)
-- [ ] Expose staff-accessible configuration for throttle and slot capacity adjustments
-- [ ] Deliver heartbeat endpoint so devices can report liveness / capture last_seen timestamps
+- [x] Add per-shift summary endpoint (order counts, revenue, average prep time)
+- [x] Expose staff-accessible configuration for throttle and slot capacity adjustments
+- [x] Deliver heartbeat endpoint so devices can report liveness / capture last_seen timestamps
 
 ## Phase 2 – Menu & Inventory Management
 - [ ] CRUD endpoints for menu items (name, description, base price)
@@ -76,3 +76,4 @@ _Last updated: 2024-02-16_
 
 ### Iteration History
 - **Iteration 1 (2024-02-16):** Bootstrapped roadmap, added truck & location discovery endpoints for the mobile client, refreshed README to describe available capabilities.
+- **Iteration 2 (2024-03-01):** Added device heartbeat tracking, per-shift configuration management, and summary reporting endpoints for mobile clients.

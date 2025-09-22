@@ -2,12 +2,14 @@ from typing import Optional, List
 from datetime import datetime, timezone
 from sqlmodel import SQLModel, Field
 
+
 class StaffRole(str):
     OWNER = "Owner"
     MANAGER = "Manager"
     TRUCK_LEAD = "TruckLead"
     COOK = "Cook"
     CASHIER = "Cashier"
+
 
 class Staff(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -17,6 +19,7 @@ class Staff(SQLModel, table=True):
     role: str = StaffRole.TRUCK_LEAD
     truck_id: Optional[int] = Field(default=None, foreign_key="truck.id")
 
+
 class Device(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     staff_id: int = Field(foreign_key="staff.id")
@@ -24,6 +27,8 @@ class Device(SQLModel, table=True):
     platform: str = "ios"
     app_version: str = "0"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_seen_at: Optional[datetime] = None
+
 
 class Truck(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -31,6 +36,7 @@ class Truck(SQLModel, table=True):
     capacity: int = 12
     tz: str = "America/Moncton"
     active: bool = True
+
 
 class Location(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -41,10 +47,12 @@ class Location(SQLModel, table=True):
     tax_region: str = "NB"
     geofence_m: int = 300
 
+
 class ShiftStatus(str):
     CHECKED_IN = "CHECKED_IN"
     PAUSED = "PAUSED"
     CHECKED_OUT = "CHECKED_OUT"
+
 
 class TruckShift(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -60,11 +68,13 @@ class TruckShift(SQLModel, table=True):
     lat: float = 0.0
     lon: float = 0.0
 
+
 class MenuItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     description: str = ""
     base_price_cents: int
+
 
 class TruckMenuItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -77,6 +87,7 @@ class TruckMenuItem(SQLModel, table=True):
     low_stock_threshold: int = 2
     prep_time_sec: int = 300
 
+
 class OrderState(str):
     NEW = "NEW"
     PAID = "PAID"
@@ -86,6 +97,7 @@ class OrderState(str):
     PICKED_UP = "PICKED_UP"
     CANCELED = "CANCELED"
     REFUNDED = "REFUNDED"
+
 
 class Order(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -98,6 +110,8 @@ class Order(SQLModel, table=True):
     tip_cents: int = 0
     total_cents: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    prep_completed_at: Optional[datetime] = None
+
 
 class OrderItem(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
