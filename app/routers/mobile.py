@@ -9,7 +9,7 @@ import asyncio, json
 from ..db import get_session
 from ..auth import require_auth, make_token, hash_pw
 from ..models import (
-    Staff, Device, TruckShift, ShiftStatus,
+    Staff, Device, Truck, TruckShift, ShiftStatus,
     Location, MenuItem, TruckMenuItem,
     Order, OrderItem, OrderState
 )
@@ -96,9 +96,68 @@ def resume_shift(shift_id: int, staff: Staff = Depends(require_auth), session: S
     asyncio.create_task(hub.emit(shift_id, {"event":"resume"}))
     return {"status": sh.status}
 
-# Menu & Inventory
 from pydantic import BaseModel
 
+
+class TruckInfo(BaseModel):
+    id: int
+    name: str
+    capacity: int
+    tz: str
+
+
+class TruckEnvelope(BaseModel):
+    trucks: List[TruckInfo]
+
+
+@router.get("/trucks", response_model=TruckEnvelope)
+def list_trucks(staff: Staff = Depends(require_auth), session: Session = Depends(get_session)):
+    query = select(Truck).where(Truck.active == True)  # noqa: E712 - SQLModel bool comparison
+    if staff.truck_id:
+        query = query.where(Truck.id == staff.truck_id)
+    trucks = session.exec(query.order_by(Truck.name.asc())).all()
+    return {
+        "trucks": [
+            TruckInfo(id=t.id, name=t.name, capacity=t.capacity, tz=t.tz)
+            for t in trucks
+        ]
+    }
+
+
+class LocationInfo(BaseModel):
+    id: int
+    name: str
+    address: str
+    lat: float
+    lon: float
+    taxRegion: str
+    geofenceMeters: int
+
+
+class LocationEnvelope(BaseModel):
+    locations: List[LocationInfo]
+
+
+@router.get("/locations", response_model=LocationEnvelope)
+def list_locations(_staff: Staff = Depends(require_auth), session: Session = Depends(get_session)):
+    locations = session.exec(select(Location).order_by(Location.name.asc())).all()
+    return {
+        "locations": [
+            LocationInfo(
+                id=loc.id,
+                name=loc.name,
+                address=loc.address,
+                lat=loc.lat,
+                lon=loc.lon,
+                taxRegion=loc.tax_region,
+                geofenceMeters=loc.geofence_m,
+            )
+            for loc in locations
+        ]
+    }
+
+
+# Menu & Inventory
 class MenuEnvelope(BaseModel):
     items: List[dict]
 
