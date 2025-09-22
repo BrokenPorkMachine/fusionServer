@@ -1,52 +1,65 @@
 # FusionX — FastAPI server for roaming food truck ordering
 
-This repo includes:
-- **Mobile API** for the iOS TruckKDS app (auth, device register, shift check-in/out, pause/resume, per-shift inventory, KDS, WebSocket).
-- **Dev tools**: seed data and simulated orders.
+FusionX powers the TruckKDS mobile experience for roaming food truck crews. The service focuses on staff
+operations (authentication, shift management, menu + inventory, kitchen display, and real-time updates) so
+teams can keep up with high-volume events.
 
-## Quickstart
+## Currently Available
+
+### Authentication & Devices
+- `POST /api/mobile/login` — username/password login that returns a bearer token and staff profile
+- `POST /api/mobile/devices/register` — register APNs tokens for the signed-in staff member
+
+### Shift Operations
+- `GET /api/mobile/trucks` — list active trucks the staff member can operate
+- `GET /api/mobile/locations` — list service locations for shift check-in
+- `GET /api/mobile/shift/active` — fetch the most recent shift for the staff member's truck
+- `POST /api/mobile/shift/checkin` — begin a shift at a location
+- `POST /api/mobile/shift/{id}/checkout` — close out a shift and notify connected devices
+- `POST /api/mobile/shift/{id}/pause` / `POST /api/mobile/shift/{id}/resume` — manage temporary pauses
+
+### Menu & Inventory
+- `GET /api/mobile/shift/{id}/menu` — fetch base menu items with per-shift overrides
+- `PATCH /api/mobile/shift/{id}/inventory` — bulk update stock counts and sold-out flags
+
+### Kitchen Display & Orders
+- `GET /api/mobile/shift/{id}/kds` — aggregated ticket queue ordered by creation time
+- `POST /api/mobile/order/{order_id}/advance` — guarded order state transitions
+
+### Real-time Events
+- `WS /api/mobile/ws/shift/{id}` — low stock, pause/resume, and new order notifications for TruckKDS
+
+### Developer & Testing Utilities
+- `POST /dev/seed` — seed baseline trucks, staff, locations, and menu items
+- `POST /dev/sim-order/{shift_id}` — create a simulated paid order and push a KDS notification
+
+## Getting Started
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env  # adjust environment variables as needed
 make run
 ```
-Open: http://127.0.0.1:8000
+Open http://127.0.0.1:8000 for automatic FastAPI docs.
 
-Seed data:
+### Seed the database
 ```bash
 make seed
 # username: chef   password: password
 ```
 
-### Endpoints
-- `POST /api/mobile/login` → `{ token, staff }`
-- `POST /api/mobile/devices/register` → registers APNs token
-- `GET /api/mobile/shift/active`
-- `POST /api/mobile/shift/checkin {truck_id, location_id}`
-- `POST /api/mobile/shift/{id}/checkout`
-- `POST /api/mobile/shift/{id}/pause` (reason, minutes)
-- `POST /api/mobile/shift/{id}/resume`
-- `GET /api/mobile/shift/{id}/menu` → per-shift prices/stock
-- `PATCH /api/mobile/shift/{id}/inventory` → bulk stock updates
-- `GET /api/mobile/shift/{id}/kds` → tickets
-- `POST /api/mobile/order/{order_id}/advance` → guarded transitions
-- `WS /api/mobile/ws/shift/{id}` → events: `new_order`, `low_stock`, `pause`, `resume`
+## Development Notes
+- The project uses [FastAPI](https://fastapi.tiangolo.com/) with [SQLModel](https://sqlmodel.tiangolo.com/) for persistence.
+- Run `make fmt` to apply basic formatting (Black) to the `app/` package.
+- Configure environment variables via `.env`; see `app/config.py` for supported keys.
 
-Dev helpers:
-- `POST /dev/seed`
-- `POST /dev/sim-order/{shift_id}`
+## Roadmap
+The long-term roadmap lives in [`ROADMAP.md`](ROADMAP.md). Each iteration updates the roadmap and this README as new features
+ship.
 
-### Wire to TruckKDS (iOS)
-Set `Config.swift` in the TruckKDS app:
-```swift
-static let apiBase = URL(string: "http://YOUR-IP:8000")!
-static let wsBase  = URL(string: "ws://YOUR-IP:8000")!
-```
-
-### Production notes
-- Replace token system with real JWT/OIDC.
-- Replace SQLite with Postgres.
-- Add APNs push (server-side) and rate limits.
-- Enforce role-based access per truck.
-- Add atomic stock decrement on payment success in the **customer checkout** flow.
+## Production Considerations
+- Replace the ad-hoc token system with JWT/OIDC and revoke-on-demand.
+- Migrate from SQLite to Postgres with migrations.
+- Add APNs push delivery, API rate limiting, and per-route authorization controls.
+- Enforce atomic inventory adjustments once customer ordering is wired in.
