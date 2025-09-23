@@ -1,39 +1,115 @@
 from __future__ import annotations
-from fastapi import (
-    APIRouter,
-    Depends,
-    HTTPException,
-    WebSocket,
-    WebSocketDisconnect,
-    Body,
-)
-from fastapi.responses import JSONResponse
-from sqlmodel import Session, select
-from typing import Any, Dict, List, Optional
-from datetime import datetime, timedelta, timezone
-import asyncio, json
 
+import asyncio
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from sqlmodel import Session, select
+
+from ..auth import hash_pw, make_token, require_auth
 from ..db import get_session
-from ..auth import require_auth, make_token, hash_pw
+from ..hub import hub
 from ..models import (
-    Staff,
+    AuditLog,
     Device,
-    Truck,
-    TruckShift,
-    ShiftStatus,
+    InventoryAdjustment,
     Location,
+    MenuCategory,
     MenuItem,
-    TruckMenuItem,
+    NotificationChannel,
     Order,
     OrderItem,
     OrderState,
+    Staff,
+    Truck,
+    TruckMenuItem,
+    TruckShift,
+    ShiftStatus,
 )
-from ..hub import hub
+from ..services.notifications import notification_service
+from ..utils.async_helpers import fire_and_forget
+
 
 router = APIRouter(prefix="/api/mobile", tags=["mobile"])
 
 
-@router.post("/login")
+def _record_audit(
+    session: Session,
+    staff: Staff,
+    action: str,
+    entity_type: str,
+    entity_id: Optional[int],
+    metadata: Optional[dict] = None,
+) -> None:
+    session.add(
+        AuditLog(
+            staff_id=staff.id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            metadata_json=json.dumps(metadata or {}),
+        )
+    )
+
+
+def _ensure_truck_menu_item(session: Session, shift_id: int, menu_item: MenuItem) -> TruckMenuItem:
+    tmi = session.exec(
+        select(TruckMenuItem).where(
+            TruckMenuItem.shift_id == shift_id,
+            TruckMenuItem.menu_item_id == menu_item.id,
+            TruckMenuItem.is_special == False,
+        )
+    ).first()
+    if not tmi:
+        tmi = TruckMenuItem(shift_id=shift_id, menu_item_id=menu_item.id)
+        session.add(tmi)
+        session.commit()
+        session.refresh(tmi)
+    return tmi
+
+
+def _menu_entry(
+    tmi: TruckMenuItem,
+    base: Optional[MenuItem],
+    categories: Dict[int, MenuCategory],
+) -> dict:
+    category_id = tmi.category_id or (base.category_id if base else None)
+    category_name = (
+        categories[category_id].name if category_id and category_id in categories else None
+    )
+    price = (
+        tmi.price_override_cents
+        if tmi.price_override_cents is not None
+        else base.base_price_cents if base else 0
+    )
+    return {
+        "menuItemId": base.id if base else None,
+        "truckMenuItemId": tmi.id,
+        "name": tmi.display_name or (base.name if base else tmi.display_name or ""),
+        "description": tmi.display_description or (base.description if base else ""),
+        "priceCents": price,
+        "stockCount": tmi.stock_count,
+        "outOfStock": tmi.out_of_stock,
+        "category": category_name,
+        "isSpecial": tmi.is_special,
+        "displayOrder": tmi.display_order
+        if tmi.display_order is not None
+        else (base.sort_order if base else 0),
+        "availableStart": tmi.available_start or (base.available_start if base else None),
+        "availableEnd": tmi.available_end or (base.available_end if base else None),
+    }
+
+
+class LoginResponse(BaseModel):
+    token: str
+    staff: Dict[str, Any]
+
+
+@router.post("/login", response_model=LoginResponse)
 def mobile_login(
     payload: Dict[str, str] = Body(...), session: Session = Depends(get_session)
 ):
@@ -43,7 +119,10 @@ def mobile_login(
     if not st or st.password_hash != hash_pw(password):
         raise HTTPException(status_code=401, detail="Bad credentials")
     tok = make_token(st)
-    return {"token": tok, "staff": {"id": st.id, "name": st.name, "role": st.role}}
+    return LoginResponse(
+        token=tok,
+        staff={"id": st.id, "name": st.name, "role": st.role},
+    )
 
 
 @router.post("/devices/register", status_code=204)
@@ -65,12 +144,15 @@ def register_device(
             apns_token=token,
             platform=payload.get("platform", "ios"),
             app_version=payload.get("app_version", "0"),
+            os_version=payload.get("os_version", "unknown"),
             last_seen_at=now,
         )
     else:
         dev.platform = payload.get("platform", dev.platform)
         dev.app_version = payload.get("app_version", dev.app_version)
+        dev.os_version = payload.get("os_version", dev.os_version)
         dev.last_seen_at = now
+        dev.revoked_at = None
     session.add(dev)
     session.commit()
     return JSONResponse(status_code=204, content=None)
@@ -98,7 +180,53 @@ def device_heartbeat(
     dev = session.exec(query).first()
     if not dev:
         raise HTTPException(404, "device not found")
+    if dev.revoked_at:
+        raise HTTPException(403, "device revoked")
     dev.last_seen_at = datetime.now(timezone.utc)
+    session.add(dev)
+    session.commit()
+    return JSONResponse(status_code=204, content=None)
+
+
+class DeviceOut(BaseModel):
+    id: int
+    platform: str
+    appVersion: str
+    osVersion: str
+    lastSeenAt: Optional[datetime]
+
+
+@router.get("/devices", response_model=List[DeviceOut])
+def list_devices(
+    staff: Staff = Depends(require_auth), session: Session = Depends(get_session)
+):
+    devices = session.exec(
+        select(Device).where(Device.staff_id == staff.id, Device.revoked_at.is_(None))
+    ).all()
+    return [
+        DeviceOut(
+            id=dev.id,
+            platform=dev.platform,
+            appVersion=dev.app_version,
+            osVersion=dev.os_version,
+            lastSeenAt=dev.last_seen_at,
+        )
+        for dev in devices
+    ]
+
+
+@router.delete("/devices/{device_id}", status_code=204)
+def revoke_device(
+    device_id: int,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    dev = session.exec(
+        select(Device).where(Device.id == device_id, Device.staff_id == staff.id)
+    ).first()
+    if not dev:
+        raise HTTPException(404, "device not found")
+    dev.revoked_at = datetime.now(timezone.utc)
     session.add(dev)
     session.commit()
     return JSONResponse(status_code=204, content=None)
@@ -153,7 +281,22 @@ def checkin(
     session.add(shift)
     session.commit()
     session.refresh(shift)
-    return shift
+    _record_audit(
+        session,
+        staff,
+        "checkin",
+        "TruckShift",
+        shift.id,
+        {"truck_id": truck_id, "location_id": location_id},
+    )
+    session.commit()
+    return {
+        "id": shift.id,
+        "truck_id": shift.truck_id,
+        "location_id": shift.location_id,
+        "status": shift.status,
+        "starts_at": shift.starts_at,
+    }
 
 
 @router.post("/shift/{shift_id}/checkout", status_code=204)
@@ -168,8 +311,9 @@ def checkout(
     sh.status = ShiftStatus.CHECKED_OUT
     sh.ends_at = datetime.now(timezone.utc)
     session.add(sh)
+    _record_audit(session, staff, "checkout", "TruckShift", shift_id, None)
     session.commit()
-    asyncio.create_task(hub.emit(shift_id, {"event": "resume"}))
+    fire_and_forget(hub.emit(shift_id, {"event": "resume"}))
     return JSONResponse(status_code=204, content=None)
 
 
@@ -190,8 +334,9 @@ def pause_shift(
     sh.status = ShiftStatus.PAUSED
     sh.resume_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     session.add(sh)
+    _record_audit(session, staff, "pause", "TruckShift", shift_id, {"minutes": minutes})
     session.commit()
-    asyncio.create_task(hub.emit(shift_id, {"event": "pause", "reason": reason}))
+    fire_and_forget(hub.emit(shift_id, {"event": "pause", "reason": reason}))
     return {"status": sh.status, "resume_at": sh.resume_at}
 
 
@@ -209,12 +354,10 @@ def resume_shift(
     sh.status = ShiftStatus.CHECKED_IN
     sh.resume_at = None
     session.add(sh)
+    _record_audit(session, staff, "resume", "TruckShift", shift_id, None)
     session.commit()
-    asyncio.create_task(hub.emit(shift_id, {"event": "resume"}))
+    fire_and_forget(hub.emit(shift_id, {"event": "resume"}))
     return {"status": sh.status}
-
-
-from pydantic import BaseModel, Field
 
 
 class ShiftConfig(BaseModel):
@@ -263,8 +406,16 @@ def update_shift_config(
     if payload.slotCapacityPerMin is not None:
         sh.slot_capacity_per_min = payload.slotCapacityPerMin
     session.add(sh)
+    _record_audit(
+        session,
+        staff,
+        "update_config",
+        "TruckShift",
+        shift_id,
+        payload.model_dump(exclude_unset=True),
+    )
     session.commit()
-    asyncio.create_task(hub.emit(shift_id, {"event": "config_updated"}))
+    fire_and_forget(hub.emit(shift_id, {"event": "config_updated"}))
     return _shift_to_config(sh)
 
 
@@ -283,9 +434,7 @@ class TruckEnvelope(BaseModel):
 def list_trucks(
     staff: Staff = Depends(require_auth), session: Session = Depends(get_session)
 ):
-    query = select(Truck).where(
-        Truck.active == True
-    )  # noqa: E712 - SQLModel bool comparison
+    query = select(Truck).where(Truck.active == True)  # noqa: E712
     if staff.truck_id:
         query = query.where(Truck.id == staff.truck_id)
     trucks = session.exec(query.order_by(Truck.name.asc())).all()
@@ -332,9 +481,8 @@ def list_locations(
     }
 
 
-# Menu & Inventory
 class MenuEnvelope(BaseModel):
-    items: List[dict]
+    items: List[Dict[str, Any]]
 
 
 @router.get("/shift/{shift_id}/menu", response_model=MenuEnvelope)
@@ -343,40 +491,46 @@ def shift_menu(
     staff: Staff = Depends(require_auth),
     session: Session = Depends(get_session),
 ):
-    base = session.exec(select(MenuItem)).all()
-    out: List[dict] = []
-    for m in base:
-        tmi = session.exec(
-            select(TruckMenuItem).where(
-                TruckMenuItem.shift_id == shift_id, TruckMenuItem.menu_item_id == m.id
-            )
-        ).first()
-        if not tmi:
-            tmi = TruckMenuItem(shift_id=shift_id, menu_item_id=m.id)
-            session.add(tmi)
-            session.commit()
-            session.refresh(tmi)
-        price = (
-            tmi.price_override_cents
-            if tmi.price_override_cents is not None
-            else m.base_price_cents
-        )
-        out.append(
-            {
-                "id": m.id,
-                "name": m.name,
-                "priceCents": price,
-                "stockCount": tmi.stock_count,
-                "outOfStock": tmi.out_of_stock,
-            }
-        )
-    return {"items": out}
+    shift = session.get(TruckShift, shift_id)
+    if not shift:
+        raise HTTPException(404, "shift not found")
+    categories = {c.id: c for c in session.exec(select(MenuCategory)).all()}
+    items: List[Dict[str, Any]] = []
+    base_items = session.exec(select(MenuItem).where(MenuItem.is_active == True)).all()
+    now = datetime.now(timezone.utc)
+    for base in base_items:
+        tmi = _ensure_truck_menu_item(session, shift_id, base)
+        start = tmi.available_start or base.available_start
+        end = tmi.available_end or base.available_end
+        if start and start > now:
+            continue
+        if end and end < now:
+            continue
+        if not tmi.visible:
+            continue
+        items.append(_menu_entry(tmi, base, categories))
+    specials = session.exec(
+        select(TruckMenuItem)
+        .where(TruckMenuItem.shift_id == shift_id, TruckMenuItem.is_special == True)
+        .order_by(TruckMenuItem.display_order.asc())
+    ).all()
+    for spec in specials:
+        if spec.available_start and spec.available_start > now:
+            continue
+        if spec.available_end and spec.available_end < now:
+            continue
+        if not spec.visible:
+            continue
+        items.append(_menu_entry(spec, None, categories))
+    items.sort(key=lambda itm: ((itm.get("category") or ""), itm.get("displayOrder"), itm["name"]))
+    return {"items": items}
 
 
 class InventoryUpdate(BaseModel):
-    menu_item_id: int
-    stock_count: Optional[int] = None
-    out_of_stock: Optional[bool] = None
+    menuItemId: Optional[int] = None
+    truckMenuItemId: Optional[int] = None
+    stockCount: Optional[int] = None
+    outOfStock: Optional[bool] = None
 
 
 class InventoryPayload(BaseModel):
@@ -390,37 +544,57 @@ def update_inventory(
     staff: Staff = Depends(require_auth),
     session: Session = Depends(get_session),
 ):
-    lows: List[int] = []
+    shift = session.get(TruckShift, shift_id)
+    if not shift:
+        raise HTTPException(404, "shift not found")
+    low_stock_items: List[TruckMenuItem] = []
     for upd in payload.updates:
-        tmi = session.exec(
-            select(TruckMenuItem).where(
-                TruckMenuItem.shift_id == shift_id,
-                TruckMenuItem.menu_item_id == upd.menu_item_id,
-            )
-        ).first()
+        tmi = None
+        if upd.truckMenuItemId:
+            tmi = session.get(TruckMenuItem, upd.truckMenuItemId)
+        elif upd.menuItemId:
+            tmi = session.exec(
+                select(TruckMenuItem).where(
+                    TruckMenuItem.shift_id == shift_id,
+                    TruckMenuItem.menu_item_id == upd.menuItemId,
+                )
+            ).first()
         if not tmi:
-            tmi = TruckMenuItem(shift_id=shift_id, menu_item_id=upd.menu_item_id)
-            session.add(tmi)
-            session.commit()
-            session.refresh(tmi)
-        if upd.stock_count is not None:
-            tmi.stock_count = max(0, upd.stock_count)
-        if upd.out_of_stock is not None:
-            tmi.out_of_stock = bool(upd.out_of_stock)
+            raise HTTPException(404, "menu item not found for shift")
+        if upd.stockCount is not None:
+            new_stock = max(0, upd.stockCount)
+            previous = tmi.stock_count or 0
+            tmi.stock_count = new_stock
+            tmi.last_stock_update_at = datetime.now(timezone.utc)
+            delta = new_stock - previous
+            if delta != 0:
+                session.add(
+                    InventoryAdjustment(
+                        shift_id=shift_id,
+                        truck_menu_item_id=tmi.id,
+                        menu_item_id=tmi.menu_item_id,
+                        delta=delta,
+                        reason="manual_adjustment",
+                        staff_id=staff.id,
+                    )
+                )
+        if upd.outOfStock is not None:
+            tmi.out_of_stock = bool(upd.outOfStock)
         session.add(tmi)
-        session.commit()
-        if tmi.stock_count is not None and tmi.stock_count <= (
-            tmi.low_stock_threshold or 0
-        ):
-            lows.append(upd.menu_item_id)
-    for mid in lows:
-        asyncio.create_task(
-            hub.emit(shift_id, {"event": "low_stock", "menu_item_id": mid})
+        threshold = tmi.low_stock_threshold or 0
+        if tmi.out_of_stock or (tmi.stock_count is not None and tmi.stock_count <= threshold):
+            low_stock_items.append(tmi)
+    session.commit()
+    for tmi in low_stock_items:
+        base = session.get(MenuItem, tmi.menu_item_id) if tmi.menu_item_id else None
+        name = tmi.display_name or (base.name if base else "Item")
+        fire_and_forget(
+            hub.emit(shift_id, {"event": "low_stock", "menu_item_id": tmi.menu_item_id or tmi.id})
         )
+        notification_service.notify_low_stock(session, shift=shift, menu_item_name=name)
     return JSONResponse(status_code=204, content=None)
 
 
-# KDS
 class TicketItem(BaseModel):
     name: str
     qty: int
@@ -431,6 +605,8 @@ class KDSTicket(BaseModel):
     order_id: int
     created_at: datetime
     state: str
+    on_hold_until: Optional[datetime]
+    hold_reason: Optional[str]
     items: List[TicketItem]
 
 
@@ -454,6 +630,7 @@ def kds(
                     OrderState.PAID,
                     OrderState.IN_QUEUE,
                     OrderState.IN_PROGRESS,
+                    OrderState.ON_HOLD,
                     OrderState.READY,
                 ]
             ),
@@ -468,6 +645,8 @@ def kds(
                 order_id=o.id,
                 created_at=o.created_at,
                 state=o.state,
+                on_hold_until=o.on_hold_until,
+                hold_reason=o.hold_reason,
                 items=[
                     TicketItem(
                         name=it.name,
@@ -485,21 +664,11 @@ class AdvancePayload(BaseModel):
     to: str
 
 
-class ShiftSummary(BaseModel):
-    shiftId: int
-    status: str
-    startedAt: datetime
-    endedAt: Optional[datetime]
-    totalOrders: int
-    revenueCents: int
-    ordersByState: Dict[str, int]
-    averagePrepSeconds: Optional[int]
-
-
 ALLOWED_ADVANCES = {
     OrderState.PAID: [OrderState.IN_QUEUE, OrderState.IN_PROGRESS],
-    OrderState.IN_QUEUE: [OrderState.IN_PROGRESS],
-    OrderState.IN_PROGRESS: [OrderState.READY],
+    OrderState.IN_QUEUE: [OrderState.IN_PROGRESS, OrderState.ON_HOLD],
+    OrderState.IN_PROGRESS: [OrderState.READY, OrderState.ON_HOLD],
+    OrderState.ON_HOLD: [OrderState.IN_PROGRESS, OrderState.IN_QUEUE],
     OrderState.READY: [OrderState.PICKED_UP],
 }
 
@@ -517,13 +686,217 @@ def advance(
     allowed = ALLOWED_ADVANCES.get(o.state, [])
     if payload.to not in allowed:
         raise HTTPException(400, f"Cannot advance from {o.state} to {payload.to}")
+    o.previous_state = o.state
     o.state = payload.to
+    o.last_state_change_at = datetime.now(timezone.utc)
     if payload.to == OrderState.READY:
         o.prep_completed_at = datetime.now(timezone.utc)
+    if payload.to != OrderState.ON_HOLD:
+        o.on_hold_until = None
+        o.hold_reason = None
     session.add(o)
+    _record_audit(session, staff, "advance", "Order", order_id, {"to": payload.to})
     session.commit()
-    asyncio.create_task(hub.emit(o.shift_id, {"event": "new_order", "order_id": o.id}))
+    fire_and_forget(hub.emit(o.shift_id, {"event": "order_advanced", "order_id": o.id}))
     return {"state": o.state}
+
+
+class OrderDetailItem(BaseModel):
+    name: str
+    qty: int
+    priceCents: int
+    modifiers: List[str]
+
+
+class OrderDetail(BaseModel):
+    orderId: int
+    state: str
+    customerName: Optional[str]
+    customerPhone: Optional[str]
+    items: List[OrderDetailItem]
+    holdReason: Optional[str]
+    onHoldUntil: Optional[datetime]
+
+
+@router.get("/order/{order_id}", response_model=OrderDetail)
+def order_detail(
+    order_id: int,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    order = session.get(Order, order_id)
+    if not order:
+        raise HTTPException(404, "order not found")
+    items = session.exec(select(OrderItem).where(OrderItem.order_id == order.id)).all()
+    return OrderDetail(
+        orderId=order.id,
+        state=order.state,
+        customerName=order.customer_name,
+        customerPhone=order.customer_phone,
+        items=[
+            OrderDetailItem(
+                name=item.name,
+                qty=item.qty,
+                priceCents=item.price_cents,
+                modifiers=json.loads(item.modifiers_json or "[]"),
+            )
+            for item in items
+        ],
+        holdReason=order.hold_reason,
+        onHoldUntil=order.on_hold_until,
+    )
+
+
+class HoldPayload(BaseModel):
+    minutes: int = Field(default=15, ge=1)
+    reason: str = "On hold"
+
+
+@router.post("/order/{order_id}/hold")
+def hold_order(
+    order_id: int,
+    payload: HoldPayload,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    order = session.get(Order, order_id)
+    if not order:
+        raise HTTPException(404, "order not found")
+    if order.state not in {OrderState.IN_QUEUE, OrderState.IN_PROGRESS}:
+        raise HTTPException(400, "Only active orders can be held")
+    order.previous_state = order.state
+    order.state = OrderState.ON_HOLD
+    order.on_hold_until = datetime.now(timezone.utc) + timedelta(minutes=payload.minutes)
+    order.hold_reason = payload.reason
+    order.last_state_change_at = datetime.now(timezone.utc)
+    session.add(order)
+    _record_audit(
+        session,
+        staff,
+        "hold",
+        "Order",
+        order_id,
+        payload.model_dump(),
+    )
+    session.commit()
+    fire_and_forget(hub.emit(order.shift_id, {"event": "order_hold", "order_id": order.id}))
+    return {"state": order.state, "on_hold_until": order.on_hold_until}
+
+
+@router.post("/order/{order_id}/resume")
+def resume_order(
+    order_id: int,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    order = session.get(Order, order_id)
+    if not order:
+        raise HTTPException(404, "order not found")
+    if order.state != OrderState.ON_HOLD:
+        raise HTTPException(400, "Order not on hold")
+    order.state = order.previous_state or OrderState.IN_QUEUE
+    order.previous_state = None
+    order.on_hold_until = None
+    order.hold_reason = None
+    order.last_state_change_at = datetime.now(timezone.utc)
+    session.add(order)
+    _record_audit(session, staff, "resume", "Order", order_id, None)
+    session.commit()
+    fire_and_forget(hub.emit(order.shift_id, {"event": "order_resume", "order_id": order.id}))
+    return {"state": order.state}
+
+
+class CancelPayload(BaseModel):
+    reason: str
+    refund: bool = False
+    refundReason: Optional[str] = None
+
+
+@router.post("/order/{order_id}/cancel")
+def cancel_order(
+    order_id: int,
+    payload: CancelPayload,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    order = session.get(Order, order_id)
+    if not order:
+        raise HTTPException(404, "order not found")
+    if order.state in {OrderState.PICKED_UP, OrderState.CANCELED, OrderState.REFUNDED}:
+        raise HTTPException(400, "Order already closed")
+    order.previous_state = order.state
+    order.cancellation_reason = payload.reason
+    order.canceled_at = datetime.now(timezone.utc)
+    order.last_state_change_at = datetime.now(timezone.utc)
+    if payload.refund:
+        order.state = OrderState.REFUNDED
+        order.refund_reason = payload.refundReason or payload.reason
+        order.refunded_at = datetime.now(timezone.utc)
+    else:
+        order.state = OrderState.CANCELED
+    session.add(order)
+    _record_audit(
+        session,
+        staff,
+        "cancel",
+        "Order",
+        order_id,
+        payload.model_dump(),
+    )
+    session.commit()
+    fire_and_forget(hub.emit(order.shift_id, {"event": "order_cancel", "order_id": order.id}))
+    return {"state": order.state}
+
+
+class BulkAdvancePayload(BaseModel):
+    orderIds: List[int]
+
+
+@router.post("/shift/{shift_id}/advance-ready")
+def bulk_advance_ready(
+    shift_id: int,
+    payload: BulkAdvancePayload,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    if not payload.orderIds:
+        raise HTTPException(400, "orderIds required")
+    updated = 0
+    now = datetime.now(timezone.utc)
+    for order in session.exec(
+        select(Order).where(Order.id.in_(payload.orderIds), Order.shift_id == shift_id)
+    ).all():
+        if order.state == OrderState.READY:
+            order.state = OrderState.PICKED_UP
+            order.last_state_change_at = now
+            updated += 1
+            session.add(order)
+    session.commit()
+    if updated:
+        fire_and_forget(hub.emit(shift_id, {"event": "bulk_advance", "count": updated}))
+    _record_audit(
+        session,
+        staff,
+        "bulk_advance",
+        "TruckShift",
+        shift_id,
+        {"orders": payload.orderIds, "updated": updated},
+    )
+    session.commit()
+    return {"updated": updated}
+
+
+class ShiftSummary(BaseModel):
+    shiftId: int
+    status: str
+    startedAt: datetime
+    endedAt: Optional[datetime]
+    totalOrders: int
+    revenueCents: int
+    ordersByState: Dict[str, int]
+    averagePrepSeconds: Optional[int]
+    canceledCount: int
+    refundedCount: int
 
 
 @router.get("/shift/{shift_id}/summary", response_model=ShiftSummary)
@@ -539,6 +912,8 @@ def shift_summary(
     revenue = 0
     orders_by_state: Dict[str, int] = {}
     prep_durations: List[float] = []
+    canceled = 0
+    refunded = 0
     for order in orders:
         revenue += order.total_cents
         orders_by_state[order.state] = orders_by_state.get(order.state, 0) + 1
@@ -546,9 +921,11 @@ def shift_summary(
             duration = (order.prep_completed_at - order.created_at).total_seconds()
             if duration >= 0:
                 prep_durations.append(duration)
-    avg_prep = (
-        int(sum(prep_durations) / len(prep_durations)) if prep_durations else None
-    )
+        if order.state == OrderState.CANCELED:
+            canceled += 1
+        if order.state == OrderState.REFUNDED:
+            refunded += 1
+    avg_prep = int(sum(prep_durations) / len(prep_durations)) if prep_durations else None
     return ShiftSummary(
         shiftId=shift_id,
         status=sh.status,
@@ -558,4 +935,46 @@ def shift_summary(
         revenueCents=revenue,
         ordersByState=orders_by_state,
         averagePrepSeconds=avg_prep,
+        canceledCount=canceled,
+        refundedCount=refunded,
     )
+
+
+class StaffProfilePayload(BaseModel):
+    phoneNumber: Optional[str] = None
+    preferredChannel: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=6)
+
+
+@router.patch("/staff/profile")
+def update_staff_profile(
+    payload: StaffProfilePayload,
+    staff: Staff = Depends(require_auth),
+    session: Session = Depends(get_session),
+):
+    changed: Dict[str, Any] = {}
+    if payload.phoneNumber is not None:
+        staff.phone_number = payload.phoneNumber
+        changed["phone_number"] = payload.phoneNumber
+    if payload.preferredChannel is not None:
+        if payload.preferredChannel not in {
+            NotificationChannel.PUSH,
+            NotificationChannel.SMS,
+            NotificationChannel.EMAIL,
+        }:
+            raise HTTPException(400, "Unsupported channel")
+        staff.preferred_notification_channel = payload.preferredChannel
+        changed["preferred_notification_channel"] = payload.preferredChannel
+    if payload.password is not None:
+        staff.password_hash = hash_pw(payload.password)
+        changed["password"] = True
+    session.add(staff)
+    if changed:
+        _record_audit(session, staff, "update_profile", "Staff", staff.id, changed)
+    session.commit()
+    return {
+        "id": staff.id,
+        "name": staff.name,
+        "phoneNumber": staff.phone_number,
+        "preferredChannel": staff.preferred_notification_channel,
+    }

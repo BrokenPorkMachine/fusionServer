@@ -33,3 +33,12 @@ async def require_auth(authorization: str | None = Header(default=None), session
     if not st:
         raise HTTPException(status_code=401, detail="Unknown user")
     return st
+
+
+def require_roles(*roles: str):
+    async def dependency(staff: Staff = Depends(require_auth)) -> Staff:
+        if roles and staff.role not in roles:
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        return staff
+
+    return dependency
